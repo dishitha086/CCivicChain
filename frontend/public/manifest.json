@@ -1,0 +1,19 @@
+{
+  "name": "CivicChain Reporter",
+  "short_name": "CivicReporter",
+  "description": "Privacy-preserving civic grievance & public infrastructure reporting on Hyperledger Fabric",
+  "start_url": "/complaints/new",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0c1017",
+  "theme_color": "#10b981",
+  "categories": ["government", "utilities", "productivity"],
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

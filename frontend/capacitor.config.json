@@ -1,0 +1,12 @@
+{
+  "appId": "org.civicchain.reporter",
+  "appName": "CivicChain Reporter",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true,
+    "allowNavigation": [
+      "*"
+    ]
+  }
+}

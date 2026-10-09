@@ -1,0 +1,37 @@
+# Node modules
+node_modules/
+*/node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+frontend/dist/
+frontend/dist-ssr/
+frontend/android/app/build/
+frontend/android/.gradle/
+frontend/android/build/
+frontend/android/.idea/
+.gradle/
+
+# Environment files (preserve template)
+.env.local
+.env.*.local
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# IDE Files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
