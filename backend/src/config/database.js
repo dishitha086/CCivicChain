@@ -138,8 +138,49 @@ export async function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_complaint_events_complaint ON complaint_events(complaint_id);
     CREATE INDEX IF NOT EXISTS idx_evidence_complaint ON evidence(complaint_id);
   `);
+    
+  // Add evidence type without deleting existing evidence.
+  const evidenceColumns = await _db.all(
+    'PRAGMA table_info(evidence)'
+  );
+
+  if (!evidenceColumns.some(column => column.name === 'evidence_type')) {
+    await _db.exec(`
+      ALTER TABLE evidence
+      ADD COLUMN evidence_type TEXT NOT NULL DEFAULT 'ORIGINAL'
+    `);
+  }
+
+  // Store separate Investigator and Verifier decisions
+  // for each individual evidence file.
+  await _db.exec(`
+    CREATE TABLE IF NOT EXISTS evidence_reviews (
+      id TEXT PRIMARY KEY,
+      evidence_id TEXT NOT NULL,
+      reviewer_role TEXT NOT NULL
+        CHECK (reviewer_role IN ('INVESTIGATOR', 'VERIFIER')),
+      reviewer_id TEXT NOT NULL,
+      decision TEXT NOT NULL
+        CHECK (decision IN ('APPROVED', 'REJECTED')),
+      comments TEXT,
+      created_at TEXT NOT NULL,
+
+      FOREIGN KEY (evidence_id)
+        REFERENCES evidence(id),
+
+      FOREIGN KEY (reviewer_id)
+        REFERENCES users(id),
+
+      UNIQUE (evidence_id, reviewer_role)
+    );
+
+    CREATE INDEX IF NOT EXISTS
+      idx_evidence_reviews_evidence
+      ON evidence_reviews(evidence_id);
+  `);
 
   console.log('✅ Database initialized at', DB_PATH);
+  
   return _db;
 }
 
