@@ -11,9 +11,9 @@ const UPLOAD_PATH = path.resolve(
 );
 
 ['evidence', 'avatars'].forEach(dir => {
-  const p = path.join(UPLOAD_PATH, dir);
-  if (!fs.existsSync(p)) {
-    fs.mkdirSync(p, { recursive: true });
+  const dirPath = path.join(UPLOAD_PATH, dir);
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
   }
 });
 
@@ -43,12 +43,7 @@ const fileFilter = (req, file, cb) => {
   if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(
-      new Error(
-        `File type ${file.mimetype} not allowed. Allowed: images, PDFs, videos, Word docs`
-      ),
-      false
-    );
+    cb(new Error(`File type ${file.mimetype} is not allowed.`), false);
   }
 };
 
@@ -56,7 +51,9 @@ export const upload = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: parseInt(process.env.MAX_FILE_SIZE, 10) || 10 * 1024 * 1024
+    fileSize:
+      parseInt(process.env.MAX_FILE_SIZE, 10) ||
+      10 * 1024 * 1024
   }
 });
 
@@ -75,40 +72,95 @@ function removeUploadedFile(file) {
   if (file?.path) {
     try {
       fs.unlinkSync(file.path);
-    } catch (_) {
+    } catch {
       // Ignore cleanup errors.
     }
   }
 }
 
 /**
- * Upload original complaint evidence or resolution evidence.
+ * Get the latest resolution evidence and its independent reviews.
  *
- * ORIGINAL:
- *   Preserves the existing citizen complaint evidence workflow.
+ * Two DIFFERENT Verifier accounts must approve the same evidence.
+ * Any Verifier rejection blocks resolution until replacement evidence
+ * is uploaded.
+ */
+async function getResolutionReviewStatus(db, evidenceId) {
+  const reviews = await db.all(
+    `SELECT id, evidence_id, reviewer_role, reviewer_id,
+            decision, comments, created_at
+     FROM evidence_reviews
+     WHERE evidence_id = ?
+     ORDER BY created_at ASC`,
+    [evidenceId]
+  );
+
+  const investigatorReviews = reviews.filter(
+    r => r.reviewer_role === 'INVESTIGATOR'
+  );
+
+  const verifierReviews = reviews.filter(
+    r => r.reviewer_role === 'VERIFIER'
+  );
+
+  const approvedVerifiers = new Set(
+    verifierReviews
+      .filter(r => r.decision === 'APPROVED')
+      .map(r => r.reviewer_id)
+  );
+
+  const rejectedVerifiers = new Set(
+    verifierReviews
+      .filter(r => r.decision === 'REJECTED')
+      .map(r => r.reviewer_id)
+  );
+
+  const rejected =
+    rejectedVerifiers.size > 0;
+
+  const approvedCount =
+    approvedVerifiers.size;
+
+  const bothApproved =
+    approvedCount >= 2 && !rejected;
+
+  return {
+    reviews,
+    investigatorReviews,
+    verifierReviews,
+    approvedVerifierCount: approvedCount,
+    rejectedVerifierCount: rejectedVerifiers.size,
+    rejected,
+    bothApproved,
+    canProceedToResolution: bothApproved
+  };
+}
+
+/**
+ * POST /api/complaints/:id/evidence
  *
- * RESOLUTION:
- *   Only AUTHORITY and ADMIN can upload repair/resolution proof.
- *   Each upload creates a new evidence record with its own hash
- *   and independent review history.
+ * Uploads each file as a separate database record.
+ * Each file receives its own SHA-256 hash.
  */
 export async function uploadEvidence(req, res) {
-  try {
-    const db = getDb();
+  let uploadedFile = req.file;
+  let databaseInsertSucceeded = false;
 
-    if (!req.file) {
+  try {
+    if (!uploadedFile) {
       return res.status(400).json({
-        error: 'No file uploaded'
+        error:
+          'No file uploaded. Use multipart/form-data and name the file field "file".'
       });
     }
+
+    const db = getDb();
 
     const evidenceType = String(
       req.body.evidence_type || 'ORIGINAL'
     ).trim().toUpperCase();
 
     if (!['ORIGINAL', 'RESOLUTION'].includes(evidenceType)) {
-      removeUploadedFile(req.file);
-
       return res.status(400).json({
         error: 'Invalid evidence_type. Use ORIGINAL or RESOLUTION.'
       });
@@ -116,12 +168,10 @@ export async function uploadEvidence(req, res) {
 
     const complaint = await db.get(
       'SELECT * FROM complaints WHERE id = ?',
-      req.params.id
+      [req.params.id]
     );
 
     if (!complaint) {
-      removeUploadedFile(req.file);
-
       return res.status(404).json({
         error: 'Complaint not found'
       });
@@ -130,29 +180,38 @@ export async function uploadEvidence(req, res) {
     const role = req.user.role;
 
     if (evidenceType === 'RESOLUTION') {
-  if (!['AUTHORITY', 'ADMIN'].includes(role)) {
-    removeUploadedFile(req.file);
-    return res.status(403).json({
-      error: 'Only Authority or Admin can upload resolution evidence.'
-    });
-  }
+      if (!['AUTHORITY', 'ADMIN'].includes(role)) {
+        return res.status(403).json({
+          error:
+            'Only Authority or Admin can upload resolution evidence.'
+        });
+      }
 
-  // The repair photo must be uploaded while the complaint is VERIFIED.
-  if (complaint.status !== 'VERIFIED') {
-    removeUploadedFile(req.file);
-    return res.status(409).json({
-      error: 'Resolution evidence must be uploaded while the complaint is VERIFIED.',
-      currentStatus: complaint.status
-    });
-  }
-}
+      // Preserve the existing lifecycle: action must be taken first.
+      if (complaint.status !== 'ACTION_TAKEN') {
+        return res.status(409).json({
+          error:
+            'Resolution evidence can only be uploaded when the complaint is ACTION_TAKEN.',
+          currentStatus: complaint.status
+        });
+      }
 
-    const sha256Hash = await computeFileHash(req.file.path);
+      if (!uploadedFile.mimetype.startsWith('image/')) {
+        return res.status(400).json({
+          error: 'Resolution evidence must be an image.'
+        });
+      }
+    }
+
     const evidenceId = uuidv4();
+    const sha256Hash = await computeFileHash(uploadedFile.path);
     const now = new Date().toISOString();
 
-    const isInvestigation =
-      ['INVESTIGATOR', 'AUTHORITY', 'ADMIN'].includes(role) ? 1 : 0;
+    const isInvestigation = [
+      'INVESTIGATOR',
+      'AUTHORITY',
+      'ADMIN'
+    ].includes(role) ? 1 : 0;
 
     await db.run(
       `INSERT INTO evidence (
@@ -174,76 +233,94 @@ export async function uploadEvidence(req, res) {
         evidenceId,
         complaint.id,
         req.user.id,
-        req.file.filename,
-        req.file.originalname,
-        req.file.path,
-        req.file.size,
-        req.file.mimetype,
+        uploadedFile.filename,
+        uploadedFile.originalname,
+        uploadedFile.path,
+        uploadedFile.size,
+        uploadedFile.mimetype,
         sha256Hash,
-        req.body.description || null,
+        typeof req.body.description === 'string'
+          ? req.body.description.trim() || null
+          : null,
         isInvestigation,
         evidenceType,
         now
       ]
     );
 
+    databaseInsertSucceeded = true;
+
+    const evidence = {
+      id: evidenceId,
+      complaint_id: complaint.id,
+      uploaded_by: req.user.id,
+      filename: uploadedFile.filename,
+      original_name: uploadedFile.originalname,
+      file_size: uploadedFile.size,
+      mime_type: uploadedFile.mimetype,
+      sha256_hash: sha256Hash,
+      description: req.body.description?.trim() || null,
+      is_investigation_evidence: isInvestigation,
+      evidence_type: evidenceType,
+      url: `/uploads/evidence/${encodeURIComponent(uploadedFile.filename)}`,
+      created_at: now
+    };
+
+    // The file must remain on disk after its database record is saved.
+    uploadedFile = null;
+
     return res.status(201).json({
       message:
         evidenceType === 'RESOLUTION'
-          ? 'Resolution evidence uploaded successfully. Investigator and Verifier reviews are pending.'
-          : 'Evidence uploaded successfully',
-      evidence: {
-        id: evidenceId,
-        complaint_id: complaint.id,
-        filename: req.file.filename,
-        original_name: req.file.originalname,
-        file_size: req.file.size,
-        mime_type: req.file.mimetype,
-        sha256_hash: sha256Hash,
-        description: req.body.description || null,
-        evidence_type: evidenceType,
-        url: `/uploads/evidence/${req.file.filename}`,
-        created_at: now
-      },
+          ? 'Resolution evidence uploaded and hashed. Two distinct Verifier approvals are required.'
+          : 'Evidence uploaded and hashed successfully.',
+      evidence,
       reviewStatus:
         evidenceType === 'RESOLUTION'
           ? {
               investigator: 'PENDING',
-              verifier: 'PENDING',
+              approvedVerifierCount: 0,
+              requiredVerifierApprovals: 2,
+              rejected: false,
+              bothApproved: false,
               canProceedToResolution: false
             }
           : undefined,
       integrity: {
         sha256: sha256Hash,
-        message:
-          'SHA-256 hash recorded. Use /api/evidence/:id/verify to check integrity at any time.'
+        isIntact: true,
+        message: 'SHA-256 hash recorded for this file.'
       }
     });
   } catch (err) {
     console.error('Upload evidence error:', err);
 
-    removeUploadedFile(req.file);
+    if (uploadedFile && !databaseInsertSucceeded) {
+      removeUploadedFile(uploadedFile);
+    }
 
     return res.status(500).json({
-      error: 'Failed to upload evidence'
+      error: 'Failed to upload evidence',
+      details:
+        process.env.NODE_ENV === 'development'
+          ? err.message
+          : undefined
     });
   }
 }
 
 /**
- * Review one specific resolution evidence file.
- *
  * POST /api/evidence/:id/review
  *
- * Expected JSON:
+ * Body:
  * {
- *   "decision": "APPROVED" or "REJECTED",
- *   "comments": "Review notes"
+ *   "decision": "APPROVED",
+ *   "comments": "Work has been completed"
  * }
  *
- * A reviewer can submit only one decision per evidence file.
- * A replacement upload receives a new evidence ID and starts
- * with fresh reviews.
+ * Each Investigator can review once.
+ * Each Verifier account can review once.
+ * Two distinct Verifier approvals are required for resolution.
  */
 export async function reviewResolutionEvidence(req, res) {
   try {
@@ -252,7 +329,8 @@ export async function reviewResolutionEvidence(req, res) {
 
     if (!['INVESTIGATOR', 'VERIFIER'].includes(role)) {
       return res.status(403).json({
-        error: 'Only the assigned review roles can review resolution evidence.'
+        error:
+          'Only Investigators and Verifiers can review resolution evidence.'
       });
     }
 
@@ -271,7 +349,7 @@ export async function reviewResolutionEvidence(req, res) {
        FROM evidence e
        JOIN complaints c ON c.id = e.complaint_id
        WHERE e.id = ?`,
-      req.params.id
+      [req.params.id]
     );
 
     if (!evidence) {
@@ -282,7 +360,8 @@ export async function reviewResolutionEvidence(req, res) {
 
     if (evidence.evidence_type !== 'RESOLUTION') {
       return res.status(400).json({
-        error: 'Only resolution evidence can be reviewed through this endpoint.'
+        error:
+          'Only resolution evidence can be reviewed through this endpoint.'
       });
     }
 
@@ -296,38 +375,37 @@ export async function reviewResolutionEvidence(req, res) {
       });
     }
 
-    // Only the newest resolution upload can be reviewed.
-    // Older files cannot be approved after replacement evidence exists.
     const latestEvidence = await db.get(
-  `SELECT id
-   FROM evidence
-   WHERE complaint_id = ?
-     AND evidence_type = 'RESOLUTION'
-   ORDER BY created_at DESC, id DESC
-   LIMIT 1`,
-  [evidence.complaint_id]
-);
+      `SELECT id
+       FROM evidence
+       WHERE complaint_id = ?
+         AND evidence_type = 'RESOLUTION'
+       ORDER BY created_at DESC, rowid DESC
+       LIMIT 1`,
+      [evidence.complaint_id]
+    );
 
     if (!latestEvidence || latestEvidence.id !== evidence.id) {
       return res.status(409).json({
-        error: 'This evidence has been superseded. Review the latest upload instead.'
+        error:
+          'This evidence has been superseded. Review the latest upload instead.'
       });
     }
 
+    // Check this user's review, not the whole role.
     const existingReview = await db.get(
       `SELECT id, decision
        FROM evidence_reviews
-       WHERE evidence_id = ? AND reviewer_role = ?`,
-      [evidence.id, role]
+       WHERE evidence_id = ?
+         AND reviewer_id = ?`,
+      [evidence.id, req.user.id]
     );
 
     if (existingReview) {
       return res.status(409).json({
         error:
-          'You have already reviewed this evidence. The decision cannot be changed for the same file.',
-        existingDecision: existingReview.decision,
-        message:
-          'If the evidence was rejected, the Authority must upload replacement evidence.'
+          'You have already reviewed this evidence. Each account can review a file only once.',
+        existingDecision: existingReview.decision
       });
     }
 
@@ -359,57 +437,51 @@ export async function reviewResolutionEvidence(req, res) {
       ]
     );
 
-    const reviews = await db.all(
-      `SELECT reviewer_role, decision, comments, created_at
-       FROM evidence_reviews
-       WHERE evidence_id = ?`,
-      [evidence.id]
+    const status = await getResolutionReviewStatus(
+      db,
+      evidence.id
     );
 
-    const investigatorReview = reviews.find(
-      review => review.reviewer_role === 'INVESTIGATOR'
-    );
-
-    const verifierReview = reviews.find(
-      review => review.reviewer_role === 'VERIFIER'
-    );
-
-    const rejected =
-      investigatorReview?.decision === 'REJECTED' ||
-      verifierReview?.decision === 'REJECTED';
-
-    const bothApproved =
-      investigatorReview?.decision === 'APPROVED' &&
-      verifierReview?.decision === 'APPROVED';
+    const message = status.rejected
+      ? 'A Verifier rejected this evidence. The Authority must upload replacement evidence.'
+      : status.bothApproved
+        ? 'Two distinct Verifiers approved the evidence. The Authority may proceed to resolve the complaint.'
+        : `Review recorded. ${Math.max(
+            0,
+            2 - status.approvedVerifierCount
+          )} additional Verifier approval(s) required.`;
 
     return res.status(201).json({
-      message: rejected
-        ? 'Evidence rejected. The complaint remains open and the Authority must upload replacement evidence.'
-        : bothApproved
-          ? 'Both reviewers approved this evidence. It may proceed to the complaint resolution workflow.'
-          : 'Review recorded. The other reviewer must independently review this evidence.',
+      message,
       review: {
         id: reviewId,
         evidence_id: evidence.id,
         reviewer_role: role,
+        reviewer_id: req.user.id,
         decision,
         comments,
         created_at: now
       },
       reviewStatus: {
-        investigator: investigatorReview?.decision || 'PENDING',
-        verifier: verifierReview?.decision || 'PENDING',
-        rejected,
-        bothApproved,
-        canProceedToResolution: bothApproved && !rejected,
-        requiresReplacementEvidence: rejected
+        approvedVerifierCount: status.approvedVerifierCount,
+        requiredVerifierApprovals: 2,
+        rejectedVerifierCount: status.rejectedVerifierCount,
+        rejected: status.rejected,
+        bothApproved: status.bothApproved,
+        canProceedToResolution: status.canProceedToResolution,
+        requiresReplacementEvidence: status.rejected,
+        investigatorReviews: status.investigatorReviews,
+        verifierReviews: status.verifierReviews
       }
     });
   } catch (err) {
-    // Handle a duplicate review if two requests race.
-    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+    if (
+      err.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+      err.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+    ) {
       return res.status(409).json({
-        error: 'Your role has already reviewed this evidence.'
+        error:
+          'This account has already reviewed this evidence.'
       });
     }
 
@@ -422,9 +494,9 @@ export async function reviewResolutionEvidence(req, res) {
 }
 
 /**
- * Verify file integrity independently of human review.
- *
  * GET /api/evidence/:id/verify
+ *
+ * Verify the file's current SHA-256 hash against its stored hash.
  */
 export async function verifyEvidence(req, res) {
   try {
@@ -435,7 +507,7 @@ export async function verifyEvidence(req, res) {
        FROM evidence e
        JOIN complaints c ON e.complaint_id = c.id
        WHERE e.id = ?`,
-      req.params.id
+      [req.params.id]
     );
 
     if (!evidence) {
@@ -450,7 +522,7 @@ export async function verifyEvidence(req, res) {
     try {
       currentHash = await computeFileHash(evidence.file_path);
       fileExists = true;
-    } catch (_) {
+    } catch {
       // Missing or unreadable files fail integrity verification.
     }
 
@@ -466,8 +538,8 @@ export async function verifyEvidence(req, res) {
       fileExists,
       isIntact,
       message: isIntact
-        ? 'Evidence integrity verified - file has not been tampered with'
-        : 'HASH MISMATCH - evidence may have been altered or file is missing'
+        ? 'Evidence integrity verified - file has not been tampered with.'
+        : 'HASH MISMATCH - evidence may have been altered or is missing.'
     });
   } catch (err) {
     console.error('Verify evidence error:', err);
