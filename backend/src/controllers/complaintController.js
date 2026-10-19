@@ -44,8 +44,8 @@ function safeComplaint(complaint, requestingUser) {
 }
 
 /**
- * Returns the newest resolution evidence and the two independent reviews.
- * Review decisions are always associated with a specific evidence ID.
+ * Returns the newest resolution evidence and its reviews.
+ * Two distinct Verifier accounts must approve the same evidence.
  */
 async function getLatestResolutionReviewStatus(db, complaintId) {
   const evidence = await db.get(
@@ -61,9 +61,12 @@ async function getLatestResolutionReviewStatus(db, complaintId) {
   if (!evidence) {
     return {
       evidence: null,
+      reviews: [],
       investigator: null,
-      verifier: null,
+      verifierApprovals: [],
+      verifierApprovalCount: 0,
       rejected: false,
+      investigatorApproved: false,
       bothApproved: false
     };
   }
@@ -71,29 +74,49 @@ async function getLatestResolutionReviewStatus(db, complaintId) {
   const reviews = await db.all(
     `SELECT reviewer_role, decision, comments, reviewer_id, created_at
      FROM evidence_reviews
-     WHERE evidence_id = ?`,
+     WHERE evidence_id = ?
+     ORDER BY created_at ASC, rowid ASC`,
     [evidence.id]
   );
 
-  const investigator =
-    reviews.find(r => r.reviewer_role === 'INVESTIGATOR') || null;
+  const investigatorReviews = reviews.filter(
+    r => r.reviewer_role === 'INVESTIGATOR'
+  );
 
-  const verifier =
-    reviews.find(r => r.reviewer_role === 'VERIFIER') || null;
+  const investigator = investigatorReviews[0] || null;
 
-  const rejected =
-    investigator?.decision === 'REJECTED' ||
-    verifier?.decision === 'REJECTED';
+  // Count distinct Verifier accounts that approved this evidence.
+  const verifierApprovals = [
+    ...new Set(
+      reviews
+        .filter(
+          r =>
+            r.reviewer_role === 'VERIFIER' &&
+            r.decision === 'APPROVED'
+        )
+        .map(r => r.reviewer_id)
+    )
+  ];
+
+  // A rejection by either required review role blocks this evidence.
+  const rejected = reviews.some(r => r.decision === 'REJECTED');
+
+  const investigatorApproved =
+    investigatorReviews.some(r => r.decision === 'APPROVED');
 
   const bothApproved =
-    investigator?.decision === 'APPROVED' &&
-    verifier?.decision === 'APPROVED';
+    investigatorApproved &&
+    verifierApprovals.length >= 2 &&
+    !rejected;
 
   return {
     evidence,
+    reviews,
     investigator,
-    verifier,
+    verifierApprovals,
+    verifierApprovalCount: verifierApprovals.length,
     rejected,
+    investigatorApproved,
     bothApproved
   };
 }
@@ -283,14 +306,13 @@ export async function getComplaint(req, res) {
         evidenceId: latestReviewStatus.evidence?.id || null,
         investigator:
           latestReviewStatus.investigator?.decision || 'PENDING',
-        verifier:
-          latestReviewStatus.verifier?.decision || 'PENDING',
+        approvedVerifierCount: latestReviewStatus.verifierApprovalCount,
+        requiredVerifierApprovals: 2,
+        verifierApprovals: latestReviewStatus.verifierApprovals,
         rejected: latestReviewStatus.rejected,
         bothApproved: latestReviewStatus.bothApproved,
         requiresReplacementEvidence: latestReviewStatus.rejected,
-        canProceedToResolution:
-          latestReviewStatus.bothApproved &&
-          !latestReviewStatus.rejected
+        canProceedToResolution: latestReviewStatus.bothApproved
       },
       timeline: events,
       feedback: feedback || null
@@ -626,7 +648,6 @@ export const verifyComplaint = (req, res) =>
     })
   );
 
-
 export async function takeAction(req, res) {
   try {
     const db = getDb();
@@ -654,7 +675,7 @@ export async function takeAction(req, res) {
       });
     }
 
-    // Require a saved resolution photo BEFORE changing the status.
+    // Require saved resolution evidence before changing the status.
     const resolutionEvidence = await db.get(
       `SELECT id, filename, mime_type
        FROM evidence
@@ -667,12 +688,11 @@ export async function takeAction(req, res) {
 
     if (!resolutionEvidence) {
       return res.status(400).json({
-        error: 'Upload a resolution photo successfully before marking action taken.',
+        error: 'Upload resolution evidence before marking action taken.',
         requiresResolutionPhoto: true
       });
     }
 
-    // Use the existing lifecycle handler after validation.
     return handleTransition(
       req,
       res,
@@ -689,10 +709,9 @@ export async function takeAction(req, res) {
   }
 }
 
-
 /**
- * A complaint can only enter RESOLVED when the latest resolution
- * evidence has approvals from BOTH Investigator and Verifier.
+ * Require Investigator approval and two distinct Verifier approvals
+ * on the latest resolution evidence before resolving the complaint.
  */
 export async function resolveComplaint(req, res) {
   try {
@@ -728,7 +747,7 @@ export async function resolveComplaint(req, res) {
 
     if (reviewStatus.rejected) {
       return res.status(409).json({
-        error: 'The latest resolution evidence was rejected. The complaint remains open. The Authority must upload replacement evidence.',
+        error: 'A required review rejected the latest resolution evidence. Upload replacement evidence.',
         requiresReplacementEvidence: true,
         evidenceId: reviewStatus.evidence.id
       });
@@ -736,11 +755,14 @@ export async function resolveComplaint(req, res) {
 
     if (!reviewStatus.bothApproved) {
       return res.status(409).json({
-        error: 'Both Investigator and Verifier must approve the same latest resolution evidence before the complaint can be resolved.',
+        error: 'The latest resolution evidence requires Investigator approval and approvals from two distinct Verifier accounts before the complaint can be resolved.',
         reviewStatus: {
+          evidenceId: reviewStatus.evidence.id,
           investigator: reviewStatus.investigator?.decision || 'PENDING',
-          verifier: reviewStatus.verifier?.decision || 'PENDING',
-          evidenceId: reviewStatus.evidence.id
+          approvedVerifierCount: reviewStatus.verifierApprovalCount,
+          requiredVerifierApprovals: 2,
+          verifierApprovals: reviewStatus.verifierApprovals,
+          rejected: reviewStatus.rejected
         }
       });
     }
@@ -764,8 +786,7 @@ export async function resolveComplaint(req, res) {
 }
 
 /**
- * Keep the existing RESOLVED -> RESOLUTION_VERIFIED lifecycle,
- * but require the same two evidence approvals at this stage too.
+ * Preserve the existing RESOLVED -> RESOLUTION_VERIFIED lifecycle.
  */
 export async function verifyResolution(req, res) {
   try {
@@ -793,20 +814,30 @@ export async function verifyResolution(req, res) {
       complaint.id
     );
 
-    if (!reviewStatus.evidence || !reviewStatus.bothApproved) {
+    if (!reviewStatus.evidence) {
       return res.status(409).json({
-        error: 'Resolution verification requires both reviewers to approve the same latest resolution evidence.',
-        reviewStatus: {
-          investigator: reviewStatus.investigator?.decision || 'PENDING',
-          verifier: reviewStatus.verifier?.decision || 'PENDING',
-          evidenceId: reviewStatus.evidence?.id || null
-        }
+        error: 'Resolution evidence is required before resolution can be verified.'
       });
     }
 
     if (reviewStatus.rejected) {
       return res.status(409).json({
-        error: 'The latest resolution evidence was rejected. Replacement evidence is required.'
+        error: 'A required review rejected the latest resolution evidence. Replacement evidence is required.',
+        requiresReplacementEvidence: true,
+        evidenceId: reviewStatus.evidence.id
+      });
+    }
+
+    if (!reviewStatus.bothApproved) {
+      return res.status(409).json({
+        error: 'Resolution verification requires Investigator approval and approvals from two distinct Verifier accounts on the same latest evidence.',
+        reviewStatus: {
+          investigator: reviewStatus.investigator?.decision || 'PENDING',
+          approvedVerifierCount: reviewStatus.verifierApprovalCount,
+          requiredVerifierApprovals: 2,
+          verifierApprovals: reviewStatus.verifierApprovals,
+          evidenceId: reviewStatus.evidence.id
+        }
       });
     }
 
@@ -826,14 +857,68 @@ export async function verifyResolution(req, res) {
   }
 }
 
-export const closeComplaint = (req, res) =>
-  handleTransition(
-    req,
-    res,
-    'close',
-    ['ADMIN', 'AUTHORITY'],
-    null
-  );
+export async function closeComplaint(req, res) {
+  try {
+    const db = getDb();
+
+    const complaint = await db.get(
+      'SELECT * FROM complaints WHERE id = ?',
+      [req.params.id]
+    );
+
+    if (!complaint) {
+      return res.status(404).json({
+        error: 'Complaint not found'
+      });
+    }
+
+    if (!['ADMIN', 'AUTHORITY'].includes(req.user.role)) {
+      return res.status(403).json({
+        error: 'Only Admin or Authority can close a complaint'
+      });
+    }
+
+    if (complaint.status !== 'RESOLUTION_VERIFIED') {
+      return res.status(409).json({
+        error: 'A complaint can only be closed after its resolution has been verified.',
+        currentStatus: complaint.status
+      });
+    }
+
+    const reviewStatus = await getLatestResolutionReviewStatus(
+      db,
+      complaint.id
+    );
+
+    if (
+      !reviewStatus.evidence ||
+      !reviewStatus.bothApproved ||
+      reviewStatus.rejected
+    ) {
+      return res.status(409).json({
+        error: 'The latest resolution evidence must have Investigator approval and approvals from two distinct Verifier accounts, with no rejected reviews, before closure.',
+        evidenceId: reviewStatus.evidence?.id || null,
+        approvedVerifierCount: reviewStatus.verifierApprovalCount,
+        requiredVerifierApprovals: 2,
+        rejected: reviewStatus.rejected
+      });
+    }
+
+    return handleTransition(
+      req,
+      res,
+      'close',
+      ['ADMIN', 'AUTHORITY'],
+      null
+    );
+  } catch (err) {
+    console.error('Close complaint error:', err);
+
+    return res.status(500).json({
+      error: 'Failed to close complaint'
+    });
+  }
+}
 
 // GET /api/complaints/:id/history
 export async function getComplaintHistory(req, res) {
